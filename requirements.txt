@@ -1,0 +1,9 @@
+llama-index
+llama-index-vector-stores-chroma
+llama-index-embeddings-openai
+chromadb
+openai
+fredapi
+Wikipedia-API
+requests
+python-dotenv
