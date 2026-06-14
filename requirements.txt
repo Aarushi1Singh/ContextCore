@@ -7,3 +7,4 @@ fredapi
 Wikipedia-API
 requests
 python-dotenv
+streamlit
