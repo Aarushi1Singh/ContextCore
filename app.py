@@ -1,16 +1,46 @@
+"""
+app.py
+------
+ContextCore -- Streamlit UI.
+
+All agent/extraction/grading logic lives in core/ -- this file only
+handles layout, user input, and rendering.
+
+Rendering reads from st.session_state.analysis (set once per "Analyze" click)
+so that chat follow-ups -- which trigger their own Streamlit reruns -- don't
+lose the displayed analysis.
+"""
+
 import nest_asyncio
 nest_asyncio.apply()
-import streamlit as st
-import os
+
+import asyncio
 from dotenv import load_dotenv
+import streamlit as st
 
 load_dotenv()
 
+from llama_index.core import Settings
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+
+from core.agent_setup import setup_agent, get_run_logs
+from core.extraction import (
+    extract_causal_chain,
+    extract_graph,
+    grade_answer,
+    overall_confidence,
+    answer_followup,
+)
+from core.utils import bar_color
+
+from streamlit_agraph import agraph, Node, Edge, Config
+
+# -------------------------------------------------------------
+# Page config + styling
+# -------------------------------------------------------------
+
 st.set_page_config(page_title="ContextCore", layout="wide")
-
-
-st.title("📰 ContextCore")
-st.caption("Paste a financial/tech headline — get the causal chain across finance, macro, and tech")
 
 st.markdown("""
 <style>
@@ -27,307 +57,275 @@ section[data-testid="stSidebar"] {
     display: flex;
     flex-direction: row;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
-from llama_index.core import VectorStoreIndex, StorageContext, Settings
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.llms.openai import OpenAI
-import chromadb
+st.title("ContextCore")
+st.caption("Paste a financial/tech headline — get the causal chain across finance, macro, and tech")
 
-@st.cache_resource
-def load_index():
-    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
-    Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
-    
-    chroma_client     = chromadb.PersistentClient(path="./utils/chroma_db")
-    chroma_collection = chroma_client.get_or_create_collection("contextcore")
-    vector_store      = ChromaVectorStore(chroma_collection=chroma_collection)
-    storage_context   = StorageContext.from_defaults(vector_store=vector_store)
-    
-    return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
+DOMAIN_COLORS = {"tech": "#5B8DEF", "finance": "#2DD4A8", "macro": "#F0A857", "general": "#888888"}
 
-index = load_index()
-# st.success("Index loaded — ready for queries")
+# -------------------------------------------------------------
+# Model + agent setup (cached)
+# -------------------------------------------------------------
 
-import requests
-import re
-from llama_index.core.tools import FunctionTool
-from llama_index.core.agent import ReActAgent
-
-# Global log of chunks retrieved during the current run
-retrieved_chunks_log = []
-tool_calls_log = []
-domain_log = []
-
-@st.cache_resource
-def setup_agent():
-    retriever = index.as_retriever(similarity_top_k=3)
-
-    def search_knowledge_base(query: str) -> str:
-        """Search for macro indicators, background concepts, and indexed news."""
-        tool_calls_log.append(f"Searched knowledge base: '{query}'")
-        nodes = retriever.retrieve(query)
-        results = []
-        for n in nodes:
-            meta = n.metadata
-            retrieved_chunks_log.append({
-                "source": meta.get("source", "unknown"),
-                "title": meta.get("title", meta.get("series", meta.get("series_id",""))),
-                "url": meta.get("url", ""),
-                "published_at": meta.get("published_at", ""),
-            })
-            results.append(f"[{meta.get('source','unknown')}]: {n.text[:300]}")
-        return "\n\n".join(results)
-
-    def search_live_news(query: str) -> str:
-        """Search for recent/breaking news articles."""
-        tool_calls_log.append(f"Searched live news: '{query}'")
-        response = requests.get(
-            "https://newsapi.org/v2/everything",
-            params={"q": query, "language": "en", "sortBy": "relevancy", "pageSize": 3, "apiKey": os.getenv("NEWS_API_KEY")}
-        )
-        articles = response.json().get("articles", [])
-        if not articles:
-            return "No recent news found."
-        results = []
-        for a in articles:
-            retrieved_chunks_log.append({
-                "source": "NewsAPI",
-                "title": a.get("title", ""),
-                "url": a.get("url", ""),
-                "published_at": a.get("publishedAt", "")[:10],
-            })
-            results.append(f"[NEWS] {a['title']} ({a.get('publishedAt','')[:10]}): {a.get('description','')}")
-        return "\n\n".join(results)
-
-    def classify_domain(headline: str) -> str:
-        """Classify headline into macro/finance/tech/cross-domain."""
-        h = headline.lower()
-        def matches(words, text):
-            return any(re.search(r'\b' + w + r'\b', text) for w in words)
-        domains = []
-        if matches(["fed","rate","inflation","gdp","unemployment","recession","treasury","monetary"], h):
-            domains.append("macro")
-        if matches(["stock","market","equity","bond","bank","earnings","valuation","nasdaq","s&p"], h):
-            domains.append("finance")
-        if matches(["chip","semiconductor","ai","tech","export","nvidia","apple","microsoft","startup"], h):
-            domains.append("tech")
-        if not domains:
-            domains.append("general")
-        if len(domains) > 1:
-            domains.append("cross-domain")
-
-        tool_calls_log.append(f"Classified domain: {', '.join(domains)}")
-        domain_log.append(", ".join(domains))
-        return f"Domain classification: {', '.join(domains)}"
-
-    knowledge_tool = FunctionTool.from_defaults(fn=search_knowledge_base, name="search_knowledge_base",
-        description="Find economic indicators (rates, CPI, GDP, unemployment), background concepts, and indexed news. NOT for live breaking news.")
-    news_tool = FunctionTool.from_defaults(fn=search_live_news, name="search_live_news",
-        description="Find recent/breaking news. NOT for definitions or historical data.")
-    domain_tool = FunctionTool.from_defaults(fn=classify_domain, name="classify_domain",
-        description="Classify a headline as macro/finance/tech/cross-domain. Call this FIRST.")
-
-#     SYSTEM_PROMPT = """You are a financial news analyst with access to tools for retrieving 
-# real economic data and news. You MUST use your tools before answering — never answer from 
-# memory alone.
-
-# For every query:
-# 1. ALWAYS call classify_domain first.
-# 2. ALWAYS call search_knowledge_base to get macro/background data.
-# 3. ALWAYS call search_live_news to get recent articles.
-
-# After using all three tools, provide your final response starting with the word "Answer:" 
-# followed by exactly these three section headers:
-
-# Answer:
-# CAUSAL_CHAIN:
-# [2-4 sentences explaining the cause-and-effect chain across finance/macro/tech domains, based on retrieved data]
-
-# BACKGROUND:
-# [2-3 sentences of context the reader needs to understand this event, based on retrieved data]
-
-# DRY_FACTS:
-# [2-3 sentences stating only the verified facts/numbers from retrieved data, no interpretation]
-# """
-
-    return ReActAgent(
-        tools=[domain_tool, knowledge_tool, news_tool],
-        llm=Settings.llm,
-        verbose=True,
-        max_iterations=10,
-        # system_prompt=SYSTEM_PROMPT,
-    )
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0)
 
 agent = setup_agent()
-# st.success("Agent ready")
+run_logs = get_run_logs()
 
-import json
+if "analysis" not in st.session_state:
+    st.session_state.analysis = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# Track which tools were called, for the sidebar activity log
-tool_calls_log = []
+# -------------------------------------------------------------
+# Input
+# -------------------------------------------------------------
 
-GRADER_PROMPT = """You are a strict evaluation agent. Your job is to grade an AI-generated answer 
-against the retrieved source chunks it was based on. You must ONLY use the provided chunks as ground truth — 
-do NOT use your own knowledge to judge factual correctness.
+from core.document import extract_text_from_url
 
-ORIGINAL QUERY:
-{query}
+input_mode = st.radio("Input method", ["Type/paste text", "Paste a URL"], horizontal=True)
 
-DOMAIN CLASSIFICATION:
-{domain}
+MAX_INPUT_CHARS = 4000
 
-RETRIEVED CHUNKS (the only allowed sources of truth):
-{chunks}
+if input_mode == "Type/paste text":
+    headline = st.text_area(
+        "Paste a headline or short article snippet",
+        height=100,
+        max_chars=MAX_INPUT_CHARS,
+        placeholder="e.g. Fed raises interest rates by 0.25% amid persistent inflation",
+    )
+    st.caption(f"{len(headline)} / {MAX_INPUT_CHARS} characters")
+else:
+    url_input = st.text_input("Paste an article URL", placeholder="https://...")
+    headline = ""
+    if url_input:
+        try:
+            result = extract_text_from_url(url_input)
+            headline = result["text"]
+            if result["truncated"]:
+                st.info(f"Article was {result['original_length']} characters — using first {MAX_INPUT_CHARS}.")
+            else:
+                st.success(f"Extracted {len(headline)} characters from the article.")
+            with st.expander("Preview extracted text"):
+                st.write(headline)
+        except Exception as e:
+            st.error(f"Could not fetch article: {e}")
 
-AGENT'S ANSWER:
-{answer}
-
-Score the answer on these 6 metrics, each from 0.0 to 1.0:
-
-1. faithfulness: Are claims in the answer supported by the retrieved chunks?
-2. context_relevance: Are the retrieved chunks actually relevant to the query?
-3. causal_validity: Does the cause-effect reasoning follow logically?
-4. cross_domain_coverage: Does the answer address all domains in the classification?
-5. completeness: Does the answer address all parts of the query?
-6. source_recency: Are "what happened" claims based on recent sources vs only old background?
-
-Return ONLY valid JSON, no other text:
-{{
-  "faithfulness": 0.0,
-  "context_relevance": 0.0,
-  "causal_validity": 0.0,
-  "cross_domain_coverage": 0.0,
-  "completeness": 0.0,
-  "source_recency": 0.0,
-  "flagged_claims": [],
-  "notes": ""
-}}
-"""
-
-def grade_answer(query, domain, chunks, answer):
-    chunks_text = "\n\n".join([
-        f"[Chunk {i+1} - Source: {c['source']}, Date: {c.get('published_at','unknown')}]\n{c.get('title','')}"
-        for i, c in enumerate(chunks)
-    ]) or "No chunks retrieved."
-
-    prompt = GRADER_PROMPT.format(query=query, domain=domain, chunks=chunks_text, answer=answer)
-    response = Settings.llm.complete(prompt)
-    raw = response.text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1].replace("json", "", 1).strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"error": "parse failed", "raw": raw}
-
-
-def parse_sections(text):
-    sections = {"CAUSAL_CHAIN": "", "BACKGROUND": "", "DRY_FACTS": ""}
-    pattern = r"(CAUSAL_CHAIN|BACKGROUND|DRY_FACTS):\s*(.*?)(?=(CAUSAL_CHAIN|BACKGROUND|DRY_FACTS):|$)"
-    for match in re.finditer(pattern, text, re.DOTALL):
-        sections[match.group(1)] = match.group(2).strip()
-    return sections
-
-
-def bar_color(score):
-    if score >= 0.8:
-        return "var(--color-text-success)" if False else "#1D9E75"
-    elif score >= 0.5:
-        return "#EF9F27"
-    else:
-        return "#E24B4A"
-
-
-# ─────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────
-
-st.divider()
-headline = st.text_area("Paste a headline or short article snippet", height=100,
-    placeholder="e.g. Fed raises interest rates by 0.25% amid persistent inflation")
 
 if st.button("Analyze", type="primary"):
     if not headline.strip():
         st.warning("Please enter a headline first.")
     else:
-        retrieved_chunks_log.clear()
-        tool_calls_log.clear()
+        run_logs["chunks"].clear()
+        run_logs["calls"].clear()
+        run_logs["domain"] = "general"
 
         with st.spinner("Researching..."):
-            import asyncio
-            async def run_agent(query):
-                full_query = f"{query}\n\nWhat does this mean? Explain the causal chain across finance, macro, and tech domains."
-                return await agent.run(full_query)
+            async def run_agent(query: str):
+                return await agent.run(query)
 
-            response = asyncio.run(run_agent(headline))
-            raw_answer = str(response)
+            agent_output = asyncio.run(run_agent(headline))
+            raw_answer = str(agent_output)
 
-            FORMAT_PROMPT = f"""Here is an analysis of a news headline:
+            domain_str = run_logs["domain"]
+            extracted = extract_causal_chain(headline, domain_str, raw_answer)
+            summary = extracted["summary"]
+            causal_chain = extracted["causal_chain"]
 
-{raw_answer}
+            graph_data = extract_graph(headline, domain_str, raw_answer)
 
-Reformat this into EXACTLY these three sections, using only information from the analysis above 
-(do not add new facts):
+        chunks = run_logs["chunks"]
+        grading = grade_answer(headline, domain_str, chunks, summary)
 
-CAUSAL_CHAIN:
-[2-4 sentences on the cause-and-effect chain]
+        # Save everything needed for rendering + follow-up chat into session state
+        st.session_state.analysis = {
+            "headline": headline,
+            "summary": summary,
+            "causal_chain": causal_chain,
+            "graph_data": graph_data,
+            "raw_answer": raw_answer,
+            "chunks": chunks,
+            "grading": grading,
+            "tool_calls": list(run_logs["calls"]),
+        }
+        st.session_state.chat_history = []  # reset chat on new headline
 
-BACKGROUND:
-[2-3 sentences of context]
+st.divider()
+# -------------------------------------------------------------
+# Render (reads from session_state, survives chat reruns)
+# -------------------------------------------------------------
 
-DRY_FACTS:
-[2-3 sentences of verified facts/numbers only, no interpretation]
-"""
-            format_response = Settings.llm.complete(FORMAT_PROMPT)
-            answer_text = format_response.text
-            sections = parse_sections(answer_text)
+if st.session_state.analysis:
+    a = st.session_state.analysis
 
-        domain_str = domain_log[-1] if domain_log else "general"
-        grading = grade_answer(headline, domain_str, retrieved_chunks_log, answer_text)
+    overall_conf = overall_confidence(a["grading"])
+    conf_color = bar_color(overall_conf)
 
-        main_col = st.container()
+    unique_sources = {c["source"]: c for c in a["chunks"]}.values()
+    source_chips_html = "".join([
+        f'<span style="font-size:11px;padding:4px 10px;border-radius:10px;'
+        f'background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);'
+        f'color:#ccc">{c["source"]}</span>'
+        for c in unique_sources
+    ])
 
-        with main_col:
-            st.subheader("What this means")
-            st.write(sections["CAUSAL_CHAIN"] or "_No causal chain returned._")
+    st.markdown(f"""
+    <div style="display:flex;align-items:center;gap:16px;background:rgba(255,255,255,0.03);
+                border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:14px 18px;margin-bottom:16px">
+        <div style="flex-shrink:0">
+            <div style="font-size:24px;font-weight:700;color:{conf_color}">{overall_conf:.0%}</div>
+            <div style="font-size:11px;color:#888;margin-top:2px">confidence</div>
+        </div>
+        <div style="flex:1">
+            <div style="background:#2a2a2a;border-radius:4px;height:6px;overflow:hidden">
+                <div style="background:{conf_color};width:{overall_conf*100}%;height:6px;border-radius:4px"></div>
+            </div>
+            <div style="font-size:11px;color:#888;margin-top:4px">Based on {len(a["chunks"])} retrieved sources</div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+            {source_chips_html}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-            with st.expander("Background"):
-                st.write(sections["BACKGROUND"] or "_No background returned._")
+    tab_chat, tab_graph, tab_chain = st.tabs(["Chat", "Graph", "Causal Chain"])
 
-            with st.expander("Dry facts and sources", expanded=False):
-                st.write(sections["DRY_FACTS"] or "_No dry facts returned._")
-                st.markdown("**Sources:**")
-                seen = set()
-                for c in retrieved_chunks_log:
-                    key = c.get("url") or c.get("title")
-                    if key in seen or not c.get("title"):
-                        continue
-                    seen.add(key)
-                    if c.get("url"):
-                        st.markdown(f"- [{c['source']}] [{c['title']}]({c['url']})")
-                    else:
-                        st.markdown(f"- [{c['source']}] {c['title']}")
+    # ── Chat tab ──
+    with tab_chat:
+        with st.chat_message("assistant"):
+            st.write(a["summary"])
 
-        with st.sidebar:
-            st.markdown("**Agent activity**")
-            for t in tool_calls_log:
-                st.caption(t)
-            st.caption(f"Retrieved {len(retrieved_chunks_log)} chunks")
-            st.caption(f"Tool calls: {len(tool_calls_log)}")
-            for t in tool_calls_log:
-                st.caption(f"  - {t}")
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
 
-            st.markdown("**Confidence**")
-            if "error" not in grading:
-                for metric in ["faithfulness","context_relevance","causal_validity","cross_domain_coverage","completeness","source_recency"]:
-                    score = grading.get(metric, 0)
-                    st.caption(f"{metric.replace('_',' ').title()}: {score}")
-                    st.progress(score)
-            else:
-                st.caption("Grading failed")
+        followup = st.chat_input("Ask a follow-up about this headline...")
+        if followup:
+            st.session_state.chat_history.append({"role": "user", "content": followup})
+            reply = answer_followup(
+                a["headline"], a["raw_answer"], a["graph_data"],
+                st.session_state.chat_history[:-1], followup,
+            )
+            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+            st.rerun()
 
-        with st.expander("Raw agent output (debug)"):
-            st.code(answer_text)
+        # with st.expander("Dry facts and sources", expanded=False):
+        #     st.markdown("**Sources:**")
+        #     seen = set()
+        #     for c in a["chunks"]:
+        #         key = c.get("url") or c.get("title")
+        #         if key in seen or not c.get("title"):
+        #             continue
+        #         seen.add(key)
+        #         if c.get("url"):
+        #             st.markdown(f"- [{c['source']}] [{c['title']}]({c['url']})")
+        #         else:
+        #             st.markdown(f"- [{c['source']}] {c['title']}")
+
+    # ── Graph tab ──
+    with tab_graph:
+        nodes_raw = a["graph_data"].get("nodes", [])
+        edges_raw = a["graph_data"].get("edges", [])
+
+        if nodes_raw:
+            max_weight_node = max(nodes_raw, key=lambda n: n.get("weight", 1))
+            center_id = max_weight_node.get("id")
+
+            agraph_nodes = [
+                Node(
+                    id=n["id"],
+                    label=n.get("label", n["id"]),
+                    size=12 + (n.get("weight", 2) * 6),
+                    color=DOMAIN_COLORS.get(n.get("domain", "general"), "#888888"),
+                    font={"size": 13, "color": "#ffffff", "strokeWidth": 0},
+                    **({"x": 0, "y": 0} if n["id"] == center_id else {}),
+                )
+                for n in nodes_raw
+            ]
+            agraph_edges = [
+                Edge(
+                    source=e["source"],
+                    target=e["target"],
+                    label=e.get("label", ""),
+                    font={"size": 10, "color": "#aaaaaa", "strokeWidth": 4, "strokeColor": "#0e1117"},
+                    color="#555555",
+                )
+                for e in edges_raw
+            ]
+            config = Config(
+                width="100%",
+                height=480,
+                directed=True,
+                physics={
+                    "barnesHut": {
+                        "gravitationalConstant": -8000,
+                        "centralGravity": 0.5,
+                        "springLength": 180,
+                        "springConstant": 0.04,
+                    },
+                    "minVelocity": 0.75,
+                },
+                hierarchical=False,
+                node={"borderWidth": 2, "borderWidthSelected": 4},
+            )
+            agraph(nodes=agraph_nodes, edges=agraph_edges, config=config)
+
+            st.markdown(
+                f'<div style="display:flex;gap:16px;margin-top:8px;font-size:12px;color:#888">'
+                f'<span><span style="color:{DOMAIN_COLORS["tech"]}">●</span> Tech</span>'
+                f'<span><span style="color:{DOMAIN_COLORS["finance"]}">●</span> Finance</span>'
+                f'<span><span style="color:{DOMAIN_COLORS["macro"]}">●</span> Macro</span>'
+                f'</div>', unsafe_allow_html=True
+            )
+        else:
+            st.write("_No graph data returned._")
+
+    # ── Causal Chain tab ──
+    with tab_chain:
+        if a["causal_chain"]:
+            for i, step in enumerate(a["causal_chain"], 1):
+                domain_label = step.get("domain", "general").title()
+                conf = step.get("confidence", 0)
+                color = bar_color(conf)
+                st.markdown(
+                    f"""<div style="border-left:3px solid {color};padding:8px 12px;margin-bottom:8px">
+                    <strong>{i}. {step.get('title', '')}</strong>
+                    <span style="float:right;color:{color};font-size:12px">{domain_label} - {conf:.0%}</span><br>
+                    <span style="font-size:14px">{step.get('description', '')}</span><br>
+                    <span style="font-size:11px;color:gray;font-style:italic">{step.get('evidence', '')}</span>
+                    </div>""",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.write("_No causal chain returned._")
+
+    # ── Sidebar: technical detail ──
+    # with st.sidebar:
+    #     st.markdown("**Agent activity**")
+    #     for t in a["tool_calls"]:
+    #         st.caption(t)
+    #     st.caption(f"Retrieved {len(a['chunks'])} chunks")
+
+    #     st.markdown("**Confidence**")
+    #     if "error" not in a["grading"]:
+    #         for metric in ["faithfulness", "context_relevance", "causal_validity",
+    #                         "cross_domain_coverage", "completeness", "source_recency"]:
+    #             score = a["grading"].get(metric, 0)
+    #             st.caption(f"{metric.replace('_', ' ').title()}: {score}")
+    #             color = bar_color(score)
+    #             st.markdown(
+    #                 f"""<div style="background:#2a2a2a;border-radius:4px;height:6px;margin-bottom:8px">
+    #                 <div style="background:{color};width:{score*100}%;height:6px;border-radius:4px"></div>
+    #                 </div>""",
+    #                 unsafe_allow_html=True
+    #             )
+    #     else:
+    #         st.caption("Grading failed")
+    #         st.code(a["grading"].get("raw", "no raw output"))
+
+    # with st.expander("Raw agent output (debug)"):
+    #     st.code(a["raw_answer"])
