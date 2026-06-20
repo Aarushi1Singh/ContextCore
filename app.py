@@ -46,6 +46,10 @@ from core.document import extract_text_from_url
 
 from streamlit_agraph import agraph, Node, Edge, Config
 
+import uuid
+import json
+import streamlit.components.v1 as components
+
 # -------------------------------------------------------------
 # Page config + styling
 # -------------------------------------------------------------
@@ -91,6 +95,7 @@ st.title("ContextCore")
 
 DOMAIN_COLORS = {"tech": "#5B8DEF", "finance": "#2DD4A8", "macro": "#F0A857", "general": "#888888"}
 MAX_INPUT_CHARS = 8000
+PENDO_AGENT_ID = "Fuq3fbWcTv8xPVLgMjneIi-nWrw"
 
 # -------------------------------------------------------------
 # Model + agent setup (cached)
@@ -106,6 +111,33 @@ if "analysis" not in st.session_state:
     st.session_state.analysis = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = str(uuid.uuid4())
+if "pending_tracks" not in st.session_state:
+    st.session_state.pending_tracks = []
+
+
+def _queue_track(event_type, metadata):
+    """Queue a pendo.trackAgent() call for rendering on the next flush."""
+    st.session_state.pending_tracks.append((event_type, metadata))
+
+
+def _flush_tracks():
+    """Inject queued pendo.trackAgent() calls as browser JavaScript."""
+    if not st.session_state.pending_tracks:
+        return
+    scripts = []
+    for event_type, metadata in st.session_state.pending_tracks:
+        metadata_json = json.dumps(metadata)
+        scripts.append(
+            f'window.parent.pendo.trackAgent("{event_type}", {metadata_json});'
+        )
+    st.session_state.pending_tracks = []
+    components.html(
+        "<script>try{" + "".join(scripts) + "}catch(e){}</script>",
+        height=0,
+    )
+
 
 # st.divider()
 
@@ -184,11 +216,35 @@ with input_col:
             }
             st.session_state.chat_history = []  # reset chat on new headline
 
+            st.session_state.conversation_id = str(uuid.uuid4())
+            tools_used = list(set(
+                call.split("(")[0].split(" ->")[0].strip()
+                for call in run_logs["calls"]
+            ))
+            prompt_msg_id = str(uuid.uuid4())
+            response_msg_id = str(uuid.uuid4())
+            _queue_track("prompt", {
+                "agentId": PENDO_AGENT_ID,
+                "conversationId": st.session_state.conversation_id,
+                "messageId": prompt_msg_id,
+                "content": headline,
+            })
+            _queue_track("agent_response", {
+                "agentId": PENDO_AGENT_ID,
+                "conversationId": st.session_state.conversation_id,
+                "messageId": response_msg_id,
+                "content": summary,
+                "modelUsed": "gpt-4o-mini",
+                "toolsUsed": tools_used,
+            })
+
 # ---------------------------------------------------------
 # Results pane (reads from session_state, survives chat reruns)
 # ---------------------------------------------------------
 
 with results_col:
+    _flush_tracks()
+
     if st.session_state.analysis:
         a = st.session_state.analysis
 
@@ -247,6 +303,22 @@ with results_col:
 
                 reply = asyncio.run(run_followup())
                 st.session_state.chat_history.append({"role": "assistant", "content": reply})
+
+                followup_prompt_id = str(uuid.uuid4())
+                followup_response_id = str(uuid.uuid4())
+                _queue_track("prompt", {
+                    "agentId": PENDO_AGENT_ID,
+                    "conversationId": st.session_state.conversation_id,
+                    "messageId": followup_prompt_id,
+                    "content": followup,
+                })
+                _queue_track("agent_response", {
+                    "agentId": PENDO_AGENT_ID,
+                    "conversationId": st.session_state.conversation_id,
+                    "messageId": followup_response_id,
+                    "content": reply,
+                    "modelUsed": "gpt-4o-mini",
+                })
                 st.rerun()
 
             # with st.expander("Dry facts and sources", expanded=False):
