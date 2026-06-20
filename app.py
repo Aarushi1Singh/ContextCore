@@ -63,6 +63,9 @@ st.markdown("""
 section[data-testid="stSidebar"] {
     order: 2;
 }
+[data-testid="stTextArea"] textarea {
+    padding: 16px;
+}
 [data-testid="stAppViewContainer"] {
     display: flex;
     flex-direction: row;
