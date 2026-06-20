@@ -213,14 +213,16 @@ conversational and concise (2-4 sentences).
 """
 
 
-def answer_followup(headline: str, research: str, graph_data: dict, history: list, question: str) -> str:
+async def answer_followup_async(headline: str, research: str, graph_data: dict, history: list, question: str) -> str:
     """
-    Answers a follow-up chat question by reasoning over the existing
-    research + graph — no new tool calls, no new retrieval. This is the
-    "Phase 2" graph-based retrieval step: the graph built during the initial
-    analysis becomes the substrate for conversation, rather than re-querying
-    live sources for every follow-up.
+    Answers a follow-up chat question using the lightweight chat FunctionAgent
+    (see core/agent_setup.py: setup_chat_agent). The agent PREFERS answering
+    from the research/graph context already provided, but can call
+    search_wikipedia or search_live_news if the question needs information
+    genuinely not covered there -- scoped to finance/tech/macro topics.
     """
+    from core.agent_setup import setup_chat_agent
+
     nodes_str = ", ".join([n.get("label", n.get("id", "")) for n in graph_data.get("nodes", [])])
     edges_str = "; ".join([
         f"{e['source']} -{e.get('label','')}-> {e['target']}"
@@ -236,8 +238,10 @@ def answer_followup(headline: str, research: str, graph_data: dict, history: lis
         history=history_str,
         question=question,
     )
-    response = Settings.llm.complete(prompt)
-    return response.text.strip()
+
+    chat_agent = setup_chat_agent()
+    response = await chat_agent.run(prompt)
+    return str(response).strip()
 
 def grade_answer(query: str, domain: str, chunks: list, answer: str) -> dict:
     """
