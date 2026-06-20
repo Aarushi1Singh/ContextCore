@@ -26,6 +26,7 @@ except ValueError:
 import asyncio
 from dotenv import load_dotenv
 import streamlit as st
+import streamlit.components.v1 as components
 
 load_dotenv()
 
@@ -51,6 +52,29 @@ from streamlit_agraph import agraph, Node, Edge, Config
 # -------------------------------------------------------------
 
 st.set_page_config(page_title="ContextCore", layout="wide")
+
+# -------------------------------------------------------------
+# Pendo SDK
+# -------------------------------------------------------------
+
+components.html("""
+<script>
+(function(apiKey){
+    var parent = window.parent;
+    if (parent._pendoSnippetLoaded) return;
+    parent._pendoSnippetLoaded = true;
+    (function(p,e,n,d,o){var v,w,x,y,z;o=p[d]=p[d]||{};o._q=o._q||[];
+    v=['initialize','identify','updateOptions','pageLoad','track','trackAgent'];for(w=0,x=v.length;w<x;++w)(function(m){
+    o[m]=o[m]||function(){o._q[m===v[0]?'unshift':'push']([m].concat([].slice.call(arguments,0)));};})(v[w]);
+    y=e.createElement(n);y.async=!0;y.src='https://cdn.pendo.io/agent/static/'+apiKey+'/pendo.js';
+    z=e.getElementsByTagName(n)[0];z.parentNode.insertBefore(y,z);})(parent,parent.document,'script','pendo');
+
+    parent.pendo.initialize({
+        visitor: { id: '' }
+    });
+})('37371830-fa96-40d1-afbc-07c6facf51e3');
+</script>
+""", height=0)
 
 st.markdown("""
 <style>
