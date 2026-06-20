@@ -9,4 +9,3 @@ beautifulsoup4
 python-dotenv
 nest_asyncio
 streamlit-agraph
-python-3.12
