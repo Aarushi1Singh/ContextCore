@@ -33,6 +33,8 @@ from llama_index.core import Settings
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
+from urllib.parse import urlparse
+
 from core.agent_setup import setup_agent, get_run_logs
 from core.extraction import (
     extract_causal_chain,
@@ -43,6 +45,7 @@ from core.extraction import (
 )
 from core.utils import bar_color
 from core.document import extract_text_from_url
+from core.pendo import track as pendo_track
 
 from streamlit_agraph import agraph, Node, Edge, Config
 
@@ -143,6 +146,14 @@ with input_col:
                     st.success(f"Extracted {len(headline)} characters from the article.")
                 with st.expander("Preview extracted text"):
                     st.write(headline)
+                if st.session_state.get("_pendo_last_url") != url_input:
+                    st.session_state["_pendo_last_url"] = url_input
+                    pendo_track("url_content_extracted", {
+                        "url_domain": urlparse(url_input).netloc,
+                        "original_length": result["original_length"],
+                        "extracted_length": len(headline),
+                        "truncated": result["truncated"],
+                    })
             except Exception as e:
                 st.error(f"Could not fetch article: {e}")
 
@@ -183,6 +194,18 @@ with input_col:
                 "tool_calls": list(run_logs["calls"]),
             }
             st.session_state.chat_history = []  # reset chat on new headline
+
+            pendo_track("analysis_completed", {
+                "input_mode": input_mode,
+                "headline_length": len(headline),
+                "domain": domain_str,
+                "causal_chain_steps_count": len(causal_chain),
+                "graph_nodes_count": len(graph_data.get("nodes", [])),
+                "graph_edges_count": len(graph_data.get("edges", [])),
+                "overall_confidence": round(overall_confidence(grading), 2),
+                "tool_calls_count": len(run_logs["calls"]),
+                "chunks_count": len(chunks),
+            })
 
 # ---------------------------------------------------------
 # Results pane (reads from session_state, survives chat reruns)
@@ -247,6 +270,14 @@ with results_col:
 
                 reply = asyncio.run(run_followup())
                 st.session_state.chat_history.append({"role": "assistant", "content": reply})
+
+                pendo_track("followup_question_answered", {
+                    "question_length": len(followup),
+                    "reply_length": len(reply),
+                    "conversation_turn_count": len(st.session_state.chat_history) // 2,
+                    "original_headline_length": len(a["headline"]),
+                })
+
                 st.rerun()
 
             # with st.expander("Dry facts and sources", expanded=False):

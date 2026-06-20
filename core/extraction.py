@@ -19,6 +19,7 @@ or agent state involved.
 
 import json
 from llama_index.core import Settings
+from core.pendo import track as pendo_track
 
 
 CAUSAL_CHAIN_PROMPT_TEMPLATE = """Here is research gathered about a news headline classified as: {domain}
@@ -73,15 +74,30 @@ def extract_causal_chain(headline: str, domain: str, research: str) -> dict:
     response = Settings.llm.complete(prompt)
     raw_json = _strip_json_fences(response.text)
 
+    json_parse_success = True
     try:
         data = json.loads(raw_json)
     except json.JSONDecodeError:
+        json_parse_success = False
         data = {"summary": research, "causal_chain": []}
 
-    return {
+    result = {
         "summary": data.get("summary", ""),
         "causal_chain": data.get("causal_chain", []),
     }
+
+    chain = result["causal_chain"]
+    confidences = [s.get("confidence", 0) for s in chain]
+    pendo_track("causal_chain_extracted", {
+        "chain_steps_count": len(chain),
+        "domain": domain,
+        "has_summary": bool(result["summary"]),
+        "domains_in_chain": ",".join({s.get("domain", "") for s in chain if s.get("domain")}),
+        "avg_step_confidence": round(sum(confidences) / len(confidences), 2) if confidences else 0,
+        "json_parse_success": json_parse_success,
+    })
+
+    return result
 
 
 GRAPH_PROMPT_TEMPLATE = """Here is research gathered about a news headline classified as: {domain}
@@ -138,9 +154,11 @@ def extract_graph(headline: str, domain: str, research: str) -> dict:
     response = Settings.llm.complete(prompt)
     raw_json = _strip_json_fences(response.text)
 
+    json_parse_success = True
     try:
         data = json.loads(raw_json)
     except json.JSONDecodeError:
+        json_parse_success = False
         data = {"nodes": [], "edges": []}
 
     nodes = data.get("nodes", [])
@@ -148,9 +166,20 @@ def extract_graph(headline: str, domain: str, research: str) -> dict:
 
     # Defensive: drop edges that reference a node id that doesn't exist
     node_ids = {n.get("id") for n in nodes}
-    edges = [e for e in edges if e.get("source") in node_ids and e.get("target") in node_ids]
+    valid_edges = [e for e in edges if e.get("source") in node_ids and e.get("target") in node_ids]
 
-    return {"nodes": nodes, "edges": edges}
+    weights = [n.get("weight", 1) for n in nodes]
+    pendo_track("knowledge_graph_generated", {
+        "nodes_count": len(nodes),
+        "edges_count": len(valid_edges),
+        "domain": domain,
+        "domains_represented": ",".join({n.get("domain", "") for n in nodes if n.get("domain")}),
+        "dropped_edges_count": len(edges) - len(valid_edges),
+        "max_node_weight": max(weights) if weights else 0,
+        "json_parse_success": json_parse_success,
+    })
+
+    return {"nodes": nodes, "edges": valid_edges}
 
 GRADER_PROMPT_TEMPLATE = """You are a strict evaluation agent. Your job is to grade an AI-generated answer
 against the retrieved source chunks it was based on. You must ONLY use the provided chunks as ground truth --
@@ -264,9 +293,27 @@ def grade_answer(query: str, domain: str, chunks: list, answer: str) -> dict:
     raw = _strip_json_fences(response.text)
 
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
     except json.JSONDecodeError:
-        return {"error": "parse failed", "raw": raw}
+        result = {"error": "parse failed", "raw": raw}
+
+    grading_success = "error" not in result
+    metrics = ["faithfulness", "context_relevance", "causal_validity",
+               "cross_domain_coverage", "completeness", "source_recency"]
+    pendo_track("answer_quality_graded", {
+        "faithfulness": result.get("faithfulness", 0),
+        "context_relevance": result.get("context_relevance", 0),
+        "causal_validity": result.get("causal_validity", 0),
+        "cross_domain_coverage": result.get("cross_domain_coverage", 0),
+        "completeness": result.get("completeness", 0),
+        "source_recency": result.get("source_recency", 0),
+        "overall_confidence": round(sum(result.get(k, 0) for k in metrics) / len(metrics), 2) if grading_success else 0,
+        "chunks_count": len(chunks),
+        "flagged_claims_count": len(result.get("flagged_claims", [])),
+        "grading_success": grading_success,
+    })
+
+    return result
 
 
 def overall_confidence(grading: dict) -> float:
