@@ -15,7 +15,13 @@ Chat/Graph/Causal Chain tabs) on the right.
 """
 
 import nest_asyncio
-nest_asyncio.apply()
+try:
+    nest_asyncio.apply()
+except ValueError:
+    # nest_asyncio can't patch uvloop (used by Streamlit Cloud's server).
+    # Safe to skip -- uvloop handles nested loops differently and this
+    # patch isn't needed in that environment.
+    pass
 
 import asyncio
 from dotenv import load_dotenv
